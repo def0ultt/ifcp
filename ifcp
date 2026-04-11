@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""
+ifcp - Cache Poisoning Fuzzer
+Tests HTTP endpoints for cache poisoning via common unkeyed headers.
+Uses a unique ?cp_probe=TOKEN per test to isolate cache keys — real users are never affected.
+
+Usage: echo "https://site.com/page" | ifcp
+       cat urls.txt | ifcp -H "Cookie: session=abc123"
+       cat urls.txt | ifcp -j
+"""
+
+import sys
+import argparse
+import json
+import random
+import string
+import requests
+import re
+from urllib.parse import urlparse
+
+# ANSI color codes
+class Colors:
+    RED    = '\033[91m'
+    YELLOW = '\033[93m'
+    GREEN  = '\033[92m'
+    RESET  = '\033[0m'
+    BOLD   = '\033[1m'
+
+# Headers to test for cache poisoning
+CP_HEADERS_LIST = [
+    "Contact",
+    "From",
+    "Referer",
+    "X-Original-Url",
+    "X-Wap-Profile",
+    "Profile",
+    "X-Arbitrary",
+    "X-Http-Destinationurl",
+    "X-Forwarded",
+    "X-Forwarded-Proto",
+    "X-Forwarded-Host",
+    "X-Forwarded-For",
+    "X-Forwarded-Server",
+    "X-Forwarded-Scheme",
+    "X-Host",
+    "x-features",
+    "X-Http-Host-Override",
+    "Cluster-Client-Ip",
+    "True-Client-Ip",
+    "Client-Ip",
+    "X-Client-Ip",
+    "X-Real-Ip",
+    "X-Remote-Ip",
+    "X-Originating-Ip",
+    "X-Proxyuser-Ip",
+    "X-Remote-Addr",
+    "Cf-Connecting_ip",
+    "Forwarded",
+]
+
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Cache Poisoning Fuzzer — tests headers via isolated probe URLs'
+    )
+    parser.add_argument('-H', '--header', action='append', dest='headers',
+                        help='Custom header (can be used multiple times)')
+    parser.add_argument('-t', '--timeout', type=int, default=10,
+                        help='Request timeout in seconds (default: 10)')
+    parser.add_argument('-x', '--proxy', type=str,
+                        help='Proxy URL (e.g., http://127.0.0.1:8080)')
+    parser.add_argument('--no-color', action='store_true',
+                        help='Disable colored output')
+    parser.add_argument('-j', '--json', action='store_true',
+                        help='Output results in JSON Lines format')
+    return parser.parse_args()
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def parse_headers(header_list):
+    headers = {}
+    if header_list:
+        for h in header_list:
+            if ':' in h:
+                key, value = h.split(':', 1)
+                headers[key.strip()] = value.strip()
+    return headers
+
+
+def rand_token(k=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
+
+
+def is_cached(resp):
+    """Check response headers for typical cache hit indicators."""
+    cache_headers = [
+        "X-Cache", "CF-Cache-Status", "Age", "X-Served-By", "X-Cache-Status"
+    ]
+    return any(h in resp.headers for h in cache_headers)
+
+
+def build_probe_urls(base_url, token, strategy):
+    """Generate cache manipulation probe variations."""
+    separator = '&' if '?' in base_url else '?'
+    clean_base = base_url.rstrip('/')
+    if strategy == "standard_query":
+        return f"{base_url}{separator}cp_probe={token}"
+    elif strategy == "unkeyed_query":
+        return f"{base_url}{separator}{token}=1"
+    else:  # path_based
+        return f"{clean_base}/{token}"
+
+
+def send_request(session, url, headers, timeout):
+    return session.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        allow_redirects=False
+    )
+
+
+def make_payload(header, token):
+    """Craft a header-appropriate payload value."""
+    h = header.lower()
+    if any(k in h for k in ("url", "referer", "profile", "destinationurl")):
+        return f"https://{token}.com"
+    if h == "forwarded":
+        return f"for={token}"
+    if h in ("contact", "from"):
+        return f"root@{token}"
+    if h == "x-forwarded-scheme":
+        return "http"
+    return f"{token}_hit"
+
+
+# ─── Core scan logic ──────────────────────────────────────────────────────────
+
+def get_indicators(response, pld):
+    inds = set()
+    loc = response.headers.get('Location', '')
+    
+    if pld == 'http':
+        if loc.lower().startswith('http://'):
+            inds.add('Location Header (Downgrade)')
+        return inds
+        
+    text = response.text
+    hdrs = str(response.headers)
+    
+    if pld in loc:
+        inds.add('Location Header')
+        
+    if re.search(r'(?i)(?:src|href)\s*=["\'][^"\']*?' + re.escape(pld), text):
+        inds.add('Resource Injection')
+        
+    if pld in text or pld in hdrs:
+        inds.add('Text/Header Reflection')
+        
+    return inds
+
+def check_cache_poisoning(base_url, base_headers, timeout, session):
+    """
+    Test URL for cache poisoning via common unkeyed headers.
+
+    Strategy:
+      1. Combine all testing headers into a single poisoned request to minimize bandwidth.
+      2. Generate a unique token per header to map reflections deterministically.
+      3. Use varying cache key strategies (query args, path isolation).
+      4. Compare indicators across baseline, reflection, and probe to classify findings.
+    """
+    findings = []
+
+    for strategy in ("standard_query", "unkeyed_query", "path_based"):
+        token_base = f"cp_test_{rand_token()}"
+        probe_url = build_probe_urls(base_url, token_base, strategy)
+
+        # Prepare bulk payloads
+        poison_headers = base_headers.copy()
+        payloads_map = {}
+        for header in CP_HEADERS_LIST:
+            safe_header = header.replace('-', '_').lower()
+            header_token = f"{token_base}_{safe_header}"
+            payload = make_payload(header, header_token)
+            
+            payloads_map[header] = payload
+            poison_headers[header] = payload
+
+        try:
+            # Warm-up: try to get the poisoned response cached
+            reflection_resp = send_request(session, probe_url, poison_headers, timeout)
+            send_request(session, probe_url, poison_headers, timeout)
+
+            # Probe: clean request — did the cache serve the poisoned response?
+            probe_resp = send_request(session, probe_url, base_headers, timeout)
+            is_hit = is_cached(probe_resp)
+
+            # Analyze each header's independent payload
+            for header, payload in payloads_map.items():
+                reflection_inds = get_indicators(reflection_resp, payload)
+                probe_inds = get_indicators(probe_resp, payload)
+
+                if probe_inds:
+                    severity = "HIGH" if is_hit else "MEDIUM"
+                    findings.append({
+                        "url":       base_url,
+                        "probe_url": probe_url,
+                        "header":    header,
+                        "payload":   payload,
+                        "strategy":  strategy,
+                        "severity":  severity,
+                        "is_cached": is_hit,
+                        "issue_type": "Cache Poisoning",
+                        "details":   ", ".join(sorted(probe_inds))
+                    })
+                elif reflection_inds:
+                    findings.append({
+                        "url":       base_url,
+                        "probe_url": probe_url,
+                        "header":    header,
+                        "payload":   payload,
+                        "strategy":  strategy,
+                        "severity":  "LOW",
+                        "is_cached": False,
+                        "issue_type": "Header Reflection",
+                        "details":   ", ".join(sorted(reflection_inds))
+                    })
+
+        except requests.exceptions.Timeout:
+            print(f"[!] Timeout: BULK_TEST ({strategy}) → {base_url}", file=sys.stderr)
+        except requests.exceptions.RequestException as e:
+            print(f"[!] Request error: BULK_TEST ({strategy}) → {base_url} ({e})", file=sys.stderr)
+        except Exception as e:
+            print(f"[!] Unexpected error: {e}", file=sys.stderr)
+
+    if not findings:
+        return None
+
+    # Deduplicate findings by grouping strategies
+    grouped = {}
+    for f in findings:
+        key = (f['url'], f['header'], f['issue_type'])
+        if key not in grouped:
+            grouped[key] = f
+            grouped[key]['strategies'] = [f['strategy']]
+        else:
+            if f['strategy'] not in grouped[key]['strategies']:
+                grouped[key]['strategies'].append(f['strategy'])
+                
+    # Format standard properties back out
+    dedup = []
+    for g in grouped.values():
+        g['strategy'] = ", ".join(g['strategies'])
+        del g['strategies']
+        dedup.append(g)
+
+    return dedup
+
+
+# ─── Output rendering ─────────────────────────────────────────────────────────
+
+def render_results_json(results):
+    for findings in results:
+        for item in findings:
+            print(json.dumps({
+                "type":      item.get("issue_type", "Cache Poisoning").lower().replace(" ", "_"),
+                "severity":  item.get("severity", "UNKNOWN"),
+                "strategy":  item.get("strategy", ""),
+                "header":    item["header"],
+                "payload":   item["payload"],
+                "probe_url": item["probe_url"],
+                "url":       item["url"],
+                "details":   item.get("details", "")
+            }))
+
+
+def render_results(results, use_color):
+    if not results:
+        return
+
+    # Flatten and globally deduplicate
+    all_grouped = {}
+    for findings in results:
+        for item in findings:
+            key = (item['url'], item['header'], item.get('issue_type'))
+            if key not in all_grouped:
+                new_item = item.copy()
+                strats = [s.strip() for s in new_item['strategy'].split(',')]
+                new_item['_strats'] = set(strats)
+                
+                details = [d.strip() for d in new_item.get('details', '').split(',') if d.strip()]
+                new_item['_details'] = set(details)
+                
+                all_grouped[key] = new_item
+            else:
+                existing = all_grouped[key]
+                strats = [s.strip() for s in item['strategy'].split(',')]
+                existing['_strats'].update(strats)
+                
+                details = [d.strip() for d in item.get('details', '').split(',') if d.strip()]
+                existing['_details'].update(details)
+
+    grouped_by_target = {}
+    total_cp = 0
+    total_hr = 0
+    
+    for key, item in all_grouped.items():
+        item['strategy'] = ", ".join(sorted(item['_strats']))
+        item['details'] = ", ".join(sorted(item['_details']))
+        
+        issue_type = item.get("issue_type", "Cache Poisoning")
+        if issue_type == "Cache Poisoning":
+            total_cp += 1
+        else:
+            total_hr += 1
+            
+        parsed = urlparse(item['url'])
+        target_domain = parsed.netloc if parsed.netloc else item['url']
+        
+        if target_domain not in grouped_by_target:
+            grouped_by_target[target_domain] = []
+        grouped_by_target[target_domain].append(item)
+
+    divider = "─" * 80
+    print(divider)
+    print("Potential Cache Poisoning & Header Reflection Vulnerabilities")
+    print(divider)
+
+    for domain, items in grouped_by_target.items():
+        if use_color:
+            print(f"{Colors.GREEN}{Colors.BOLD}Target : {domain}{Colors.RESET}")
+        else:
+            print(f"Target : {domain}")
+        print("=" * 80)
+        
+        for item in items:
+            header_text = (
+                f"{Colors.RED}{item['header']}{Colors.RESET}"
+                if use_color else item['header']
+            )
+            issue_type = item.get("issue_type", "Cache Poisoning")
+            severity = item.get("severity", "LOW")
+            
+            if use_color:
+                if severity == "HIGH":
+                    sev_text = f"{Colors.RED}{Colors.BOLD}{severity}{Colors.RESET}"
+                elif severity == "MEDIUM":
+                    sev_text = f"{Colors.YELLOW}{Colors.BOLD}{severity}{Colors.RESET}"
+                else:
+                    sev_text = f"{Colors.GREEN}{Colors.BOLD}{severity}{Colors.RESET}"
+                
+                if issue_type == "Cache Poisoning":
+                    type_text = f"{Colors.RED}{Colors.BOLD}{issue_type}{Colors.RESET}"
+                else:
+                    type_text = f"{Colors.YELLOW}{issue_type}{Colors.RESET}"
+            else:
+                type_text = issue_type
+                sev_text = severity
+
+            print(f"[*] Type     : {type_text} (Severity: {sev_text})")
+            print(f"     Header   : {header_text}")
+            print(f"     Strategy : {item.get('strategy', 'standard_query')}")
+            print(f"     Details  : {item.get('details', '')}")
+            print(f"     Payload  : {item['payload']}")
+            print(f"     Probe URL: {item['probe_url']}")
+            print(f"     URL      : {item['url']}")
+            print("-" * 80)
+        print()
+
+    print(divider)
+    print(f"Total Cache Poisoning: {total_cp} | Total Header Reflection: {total_hr}")
+    print(divider)
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    args      = parse_args()
+    headers   = parse_headers(args.headers)
+    use_color = not args.no_color
+    session   = requests.Session()
+
+    if args.proxy:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session.proxies = {"http": args.proxy, "https": args.proxy}
+        session.verify  = False
+
+    if sys.stdin.isatty():
+        print("Usage: echo 'https://site.com/page' | ifcp", file=sys.stderr)
+        print("       cat urls.txt | ifcp -H 'Cookie: session=abc'", file=sys.stderr)
+        sys.exit(1)
+
+    results = []
+    tested  = 0
+
+    for line in sys.stdin:
+        url = line.strip()
+        if url and url.startswith('http'):
+            tested += 1
+            finding = check_cache_poisoning(url, headers, args.timeout, session)
+            if finding:
+                results.append(finding)
+
+    if tested == 0:
+        print("No valid URLs supplied.", file=sys.stderr)
+        sys.exit(1)
+
+    if not results:
+        print("No cache poisoning vulnerabilities detected.")
+    else:
+        if args.json:
+            render_results_json(results)
+        else:
+            render_results(results, use_color)
+
+    print(f"URLs tested: {tested}")
+
+
+if __name__ == '__main__':
+    main()
