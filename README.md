@@ -20,6 +20,7 @@
 git clone https://github.com/your-username/ifcp
 cd ifcp
 chmod +x ifcp
+sudo ln -s /usr/bin/ifcp
 ```
 
 ## Quick Start
@@ -28,12 +29,12 @@ You can pipe data directly into the application securely via `stdin`.
 
 Test a single domain:
 ```bash
-echo "https://example.com" | ./ifcp
+echo "https://example.com" |ifcp
 ```
 
 Test a massive bug bounty footprint:
 ```bash
-cat subdomains.txt | ./ifcp
+cat subdomains.txt |ifcp
 ```
 
 ## Flags & Arguments
